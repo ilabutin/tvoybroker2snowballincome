@@ -35,6 +35,7 @@ SECTION_TRADES_RE = re.compile(r"сделки\s+с\s+ценн(ыми|ыми)\s+�
 SECTION_PORTFOLIO_RE = re.compile(r"состояние\s+портфеля\s+ценн(ых|ыми)\s+бумаг", re.IGNORECASE)
 SECTION_CASH_RE = re.compile(r"движение\s+денежных\s+средств.*за\s+отчетный\s+период", re.IGNORECASE)
 SECTION_CLEARANCE_RE = re.compile(r"исполнение\s+обязательств\s+по\s+сделке", re.IGNORECASE)
+DIVIDEND_TAX_RE = re.compile(r"налог\s+в\s+размере\s+([\d.]+)", re.IGNORECASE)
 
 TRADE_TYPES_MAP: Dict[str, str] = {
     "покупка": "Buy",
@@ -60,6 +61,7 @@ HEADER_KEYS_TRADES: Dict[str, List[str]] = {
 HEADER_KEYS_PORTFOLIO: Dict[str, List[str]] = {
     "name": ["наименование цб", "наименование", "инструмент"],
     "isin": ["isin"],
+    "regnum": ["регистрации", "cfi"]
 }
 
 HEADER_KEYS_CASH: Dict[str, List[str]] = {
@@ -90,26 +92,30 @@ class TargetRow:
 
 # ---------------------------- Портфель / ISIN --------------------------------
 
-def parse_portfolio_isin_map(ws: Worksheet, debug: bool = False) -> Dict[str, str]:
+def parse_portfolio_isin_map(ws: Worksheet, debug: bool = False) -> Tuple[Dict[str, str], Dict[str, str]]:
     """
-    Из раздела «СОСТОЯНИЕ ПОРТФЕЛЯ ЦЕННЫХ БУМАГ» строит карту:
+    Из раздела «СОСТОЯНИЕ ПОРТФЕЛЯ ЦЕННЫХ БУМАГ» строит две карты:
       { norm_key(Наименование ЦБ) -> ISIN }
+      { norm_key(номер гос. регистрации) -> ISIN }
     """
     title_row = find_section_title(ws, SECTION_PORTFOLIO_RE)
     if title_row is None:
         if debug:
             print("Портфель: раздел не найден.")
-        return {}
+        return {}, {}
 
-    header_row, idx = find_header_below(ws, title_row, HEADER_KEYS_PORTFOLIO, needed=["name", "isin"])
+    header_row, idx = find_header_below(ws, title_row, HEADER_KEYS_PORTFOLIO, needed=["name", "isin", "regnum"])
     name_col = idx["name"] + 1
     isin_col = idx["isin"] + 1
+    regnum_col = idx["regnum"] + 1
 
-    mapping: Dict[str, str] = {}
+    name_mapping: Dict[str, str] = {}
+    regnum_mapping: Dict[str, str] = {}
     for r in range(header_row + 1, ws.max_row + 1):
         name = ws.cell(r, name_col).value
         isin = ws.cell(r, isin_col).value
-        if not (name or isin):
+        regnum = ws.cell(r, regnum_col).value
+        if not (name or isin or regnum):
             # Возможный конец таблицы — пустая строка
             row_vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
             if all(v in (None, "", " ") for v in row_vals):
@@ -117,12 +123,15 @@ def parse_portfolio_isin_map(ws: Worksheet, debug: bool = False) -> Dict[str, st
             continue
         name_s = norm_text(name)
         isin_s = isin_from_text(norm_text(isin)) or norm_text(isin)
+        regnum_s = norm_text(regnum)
         if name_s and isin_s:
-            mapping[norm_key(name_s)] = isin_s
+            name_mapping[norm_key(name_s)] = isin_s
+        if regnum_s and isin_s:
+            regnum_mapping[norm_key(regnum_s)] = isin_s
 
     if debug:
-        print(f"Портфель: собрано записей {len(mapping)}")
-    return mapping
+        print(f"Портфель: собрано записей с именем {len(name_mapping)} м с регистрационным номером {len(regnum_mapping)}")
+    return name_mapping, regnum_mapping
 
 
 def find_isin_by_name(text: str, name_to_isin: Dict[str, str]) -> Optional[str]:
@@ -136,6 +145,25 @@ def find_isin_by_name(text: str, name_to_isin: Dict[str, str]) -> Optional[str]:
     for nk, isin in name_to_isin.items():
         if nk and nk in key:
             return isin
+    return None
+
+def find_isin_by_regnum(text: str, regnum_to_isin: Dict[str, str]) -> Optional[str]:
+    """
+    Пытается найти ISIN инструмента по номеру регистрации, сравнивая нормализованные строки.
+    Совпадение — если номер регистрации из портфеля является подстрокой нормализованного text.
+    """
+    if not text:
+        return None
+    key = norm_key(text)
+    for nk, isin in regnum_to_isin.items():
+        if nk and nk in key:
+            return isin
+    return None
+
+def find_tax_for_dividend(text: str) -> Optional[float]:
+    match = DIVIDEND_TAX_RE.search(text)
+    if match:
+        return float(match.group(1))
     return None
 
 # ---------------------------- Сделки -----------------------------------------
@@ -261,6 +289,7 @@ def parse_trades_to_target(
 def parse_cash_to_target(
     ws: Worksheet,
     name_to_isin: Dict[str, str],
+    regnum_to_isin: Dict[str, str],
     locale_comma: bool = True,
     map_coupon_as_price_one: bool = True,
     debug: bool = False,
@@ -367,6 +396,31 @@ def parse_cash_to_target(
             ))
             r += 1
             continue
+
+        # Дивиденды -> Dividend
+        if "доход по финансовым инструментам" in op_type and "перечисление дивидендов по акциям" in comment.lower():
+            symbol = isin_from_text(comment) or find_isin_by_regnum(comment or "", regnum_to_isin)
+            price = 1.0 if map_coupon_as_price_one else None
+            qty = abs(amount) if amount is not None else None
+            tax = find_tax_for_dividend(comment)
+            rows.append(TargetRow(
+                Event="Dividend",
+                Date=date,
+                Symbol=symbol,
+                Price=price,
+                Quantity=qty + tax,
+                Currency=ccy,
+                FeeTax=tax,
+                Exchange=None,
+                NKD=0.0,
+                FeeCurrency=None,
+                DoNotAdjustCash=None,
+                Note=comment
+            ))
+            r += 1
+            continue
+
+
 
         # Иные типы операций сейчас пропускаем
         r += 1

@@ -81,7 +81,7 @@ def main():
         print(f"Открыт файл: {args.input}, лист: {ws.title}")
 
     # 1) Карту ISIN из портфеля собираем один раз
-    name_to_isin = parse_portfolio_isin_map(ws, debug=args.debug)
+    name_to_isin, regnum_to_isin = parse_portfolio_isin_map(ws, debug=args.debug)
 
     # 2) Сделки
     trade_rows = parse_trades_to_target(
@@ -100,6 +100,7 @@ def main():
         cash_rows = parse_cash_to_target(
             ws,
             name_to_isin=name_to_isin,
+            regnum_to_isin=regnum_to_isin,
             locale_comma=args.locale_comma,
             debug=args.debug,
         )
